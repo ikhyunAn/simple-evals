@@ -26,6 +26,15 @@ import blobfile as bf
 import numpy as np
 import pandas as pd
 
+# HF Candidate
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# Grader
+import os
+from openai import OpenAI
+oai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 from . import common
 from .sampler.chat_completion_sampler import (
     OPENAI_SYSTEM_MESSAGE_API,
@@ -259,6 +268,131 @@ def _aggregate_get_clipped_mean(
         convos=convos,
         metadata={"example_level_metadata": metadata},
     )
+
+
+# HF Candidate
+class HFCandidate:
+    def __init__(self, model_id: str, dtype="bfloat16"):
+        try:
+            self.tok = AutoTokenizer.from_pretrained(model_id)
+        except OSError as e:
+            raise RuntimeError(
+                f"Failed to load tokenizer for '{model_id}'. "
+                f"Please verify the model ID is correct, you have network access, "
+                f"and any gated models have been approved. Original error: {e}"
+            ) from e
+        except Exception as e:
+            raise RuntimeError(
+                f"Unexpected error loading tokenizer for '{model_id}': {e}"
+            ) from e
+        
+        # Ensure pad_token is set to avoid warnings
+        if self.tok.pad_token is None:
+            self.tok.pad_token = self.tok.eos_token
+            self.tok.pad_token_id = self.tok.eos_token_id
+        
+        try:
+            self.m = AutoModelForCausalLM.from_pretrained(
+                model_id, torch_dtype=getattr(torch, dtype), device_map="auto"
+            )
+        except torch.cuda.OutOfMemoryError as e:
+            raise RuntimeError(
+                f"Out of memory loading model '{model_id}'. "
+                f"Try a smaller model, lower precision (e.g., 'float16'), "
+                f"or adjust device_map settings. Original error: {e}"
+            ) from e
+        except OSError as e:
+            raise RuntimeError(
+                f"Failed to load model '{model_id}'. "
+                f"Please verify the model ID is correct, you have network access, "
+                f"and any gated models have been approved. Original error: {e}"
+            ) from e
+        except Exception as e:
+            raise RuntimeError(
+                f"Unexpected error loading model '{model_id}': {e}"
+            ) from e
+        
+        # Ensure model pad_token_id is set
+        if self.m.config.pad_token_id is None:
+            self.m.config.pad_token_id = self.tok.pad_token_id
+
+    def __call__(self, messages, max_new_tokens=512, temperature=0.2):
+        # Prefer chat template when available
+        if hasattr(self.tok, "apply_chat_template"):
+            prompt = self.tok.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        else:
+            # very simple fallback
+            prompt = "".join(
+                f"{m['role'].title()}: {m['content']}\n" for m in messages
+            ) + "Assistant:"
+
+        inputs = self.tok(prompt, return_tensors="pt").to(self.m.device)
+        with torch.no_grad():
+            gen_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "eos_token_id": self.tok.eos_token_id,
+                "do_sample": temperature > 0,
+            }
+            # Only pass temperature when sampling is enabled
+            if temperature > 0:
+                gen_kwargs["temperature"] = temperature
+            
+            out = self.m.generate(**inputs, **gen_kwargs)
+        gen = out[0][inputs["input_ids"].shape[1]:]
+        return self.tok.decode(gen, skip_special_tokens=True)
+
+# --- Make HF behave like a simple SamplerBase ---
+class _HFResponse:
+    def __init__(self, response_text, message_list):
+        self.response_text = response_text
+        # HealthBench expects .response_metadata with "usage" (can be None)
+        self.response_metadata = {"usage": None}
+        # HealthBench also reads .actual_queried_message_list
+        self.actual_queried_message_list = message_list
+
+class HFCandidateSampler(SamplerBase):
+    def __init__(self, model_id: str, dtype="bfloat16", max_new_tokens=512, temperature=0.2):
+        self._gen = HFCandidate(model_id=model_id, dtype=dtype)
+        self._max_new_tokens = max_new_tokens
+        self._temperature = temperature
+
+    def __call__(self, messages: MessageList):
+        text = self._gen(
+            messages,
+            max_new_tokens=self._max_new_tokens,
+            temperature=self._temperature,
+        )
+        return _HFResponse(text, messages)
+
+
+# Grade - OpenAI
+# NOTE: Currently unused; kept for potential future use.
+# Requires OpenAI Python SDK version 1.0+ and a valid API key.
+def grade_criterion_with_openai(conversation, reply_text, criterion_text, max_points, model="gpt-5"):
+    sys = {"role": "system", "content": (
+        "You are a strict clinical rubric grader. "
+        "Given a patient conversation and the model's reply, decide if the reply satisfies the criterion. "
+        "Return strict JSON: {\"satisfied\": bool, \"points\": number, \"rationale\": string}."
+    )}
+    usr = {"role": "user", "content": (
+        f"Conversation:\n{conversation}\n\n"
+        f"Model reply:\n{reply_text}\n\n"
+        f"Criterion (max {max_points}): {criterion_text}\n\n"
+        "Does the reply satisfy the criterion? Award either 0 or the full points unless the rubric "
+        "implies partial credit. Keep rationale to 1–2 sentences."
+    )}
+    resp = oai.chat.completions.create(
+        model=model,
+        messages=[sys, usr],
+        response_format={"type": "json_object"},
+    )
+    out = json.loads(resp.choices[0].message.content)
+    pts = float(out.get("points", 0))
+    # clamp just in case
+    pts = max(0.0, min(float(max_points), pts))
+    return pts, out
 
 
 class HealthBenchEval(Eval):
@@ -514,6 +648,68 @@ class HealthBenchEval(Eval):
         final_metrics = _aggregate_get_clipped_mean(results)
         return final_metrics
 
+def hf_main(
+    hf_model: str,
+    hf_dtype: str = "bfloat16",
+    hf_max_new_tokens: int = 512,
+    hf_temperature: float = 0.2,
+    grader_model: str = "gpt-5",
+    subset_name: Literal["hard", "consensus"] | None = None,
+    num_examples: int | None = None,
+    n_threads: int = 8,
+):
+    assert hf_model, "--hf_model is required for run_mode=hf"
+
+    now = datetime.now()
+    date_str = now.strftime("%Y%m%d_%H%M")
+
+    # 1) OpenAI grader (unchanged grading path)
+    grading_sampler = ChatCompletionSampler(
+        model=grader_model,
+        system_message=OPENAI_SYSTEM_MESSAGE_API,
+        max_tokens=2048,
+    )
+
+    # 2) HF candidate as a Sampler
+    hf_sampler = HFCandidateSampler(
+        model_id=hf_model,
+        dtype=hf_dtype,
+        max_new_tokens=hf_max_new_tokens,
+        temperature=hf_temperature,
+    )
+
+    # 3) Build the eval with your grader; call with HF sampler
+    eval = HealthBenchEval(
+        grader_model=grading_sampler,
+        subset_name=subset_name,
+        num_examples=num_examples,
+        n_threads=n_threads,  # keep modest for a single GPU
+    )
+    result = eval(hf_sampler)
+
+    # 4) Save reports/metrics (same style as physician_main)
+    file_stem = f"healthbench_{Path(hf_model).name}_{date_str}"
+    report_filename = Path(f"/tmp/{file_stem}.html")
+    report_filename.write_text(common.make_report(result))
+    print(f"Report saved to {report_filename}")
+
+    assert result.metrics is not None
+    metrics = result.metrics
+    result_filename = Path(f"/tmp/{file_stem}.json")
+    result_filename.write_text(json.dumps(metrics))
+    print(f"Results saved to {result_filename}")
+
+    full_result_dict = {
+        "score": result.score,
+        "metrics": result.metrics,
+        "htmls": result.htmls,
+        "convos": result.convos,
+        "metadata": result.metadata,
+    }
+    full_result_filename = Path(f"/tmp/{file_stem}_allresults.json")
+    full_result_filename.write_text(json.dumps(full_result_dict, indent=2))
+    print(f"All results saved to {full_result_filename}")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -522,8 +718,20 @@ def main():
     parser.add_argument(
         "--run_mode",
         type=str,
-        choices=["physician_completions", "physician_completion_references"],
+        choices=["physician_completions", "physician_completion_references", "hf"],
     )
+
+    # HF options
+    parser.add_argument("--hf_model", type=str, help="HF model id, e.g., meta-llama/Meta-Llama-3-8B-Instruct")
+    parser.add_argument("--hf_dtype", type=str, default="bfloat16")
+    parser.add_argument("--hf_max_new_tokens", type=int, default=512)
+    parser.add_argument("--hf_temperature", type=float, default=0.2)
+
+    # Grader model override (optional)
+    parser.add_argument("--grader_model", type=str, default="gpt-5")
+    parser.add_argument("--subset", type=str, choices=["hard", "consensus"], default=None)
+
+
     parser.add_argument("--examples", type=int, help="Number of examples to run")
     parser.add_argument(
         "--n-threads",
@@ -545,7 +753,17 @@ def main():
             num_examples=args.examples,
             n_threads=args.n_threads or 1,
         )
-
+    elif args.run_mode == "hf":
+        hf_main(
+            hf_model=args.hf_model,
+            hf_dtype=args.hf_dtype,
+            hf_max_new_tokens=args.hf_max_new_tokens,
+            hf_temperature=args.hf_temperature,
+            grader_model=args.grader_model,
+            subset_name=args.subset,
+            num_examples=args.examples,
+            n_threads=args.n_threads or 1,
+        )
     else:
         raise ValueError(f"Invalid run mode: {args.run_mode}")
 
