@@ -663,8 +663,18 @@ def hf_main(
     grader_model: str = "gpt-5",
     subset_name: Literal["hard", "consensus"] | None = None,
     num_examples: int | None = None,
-    n_threads: int = 8,
+    n_threads: int = 1,  # FIXED: Default to 1 for GPU models (not thread-safe)
 ):
+    """
+    Run HealthBench evaluation using a HuggingFace model as the candidate.
+    
+    Note: n_threads should be kept at 1 for HuggingFace models because:
+    - PyTorch models are not thread-safe
+    - GPU operations serialize anyway, providing no speed benefit from threading
+    - Multiple threads can cause crashes or deadlocks
+    
+    The grader (OpenAI) will still use parallel API calls internally.
+    """
     assert hf_model, "--hf_model is required for run_mode=hf"
 
     now = datetime.now()
@@ -690,7 +700,7 @@ def hf_main(
         grader_model=grading_sampler,
         subset_name=subset_name,
         num_examples=num_examples,
-        n_threads=n_threads,  # keep modest for a single GPU
+        n_threads=n_threads,  # Use provided n_threads (should be 1 for HF models)
     )
     result = eval(hf_sampler)
 
@@ -743,8 +753,8 @@ def main():
     parser.add_argument(
         "--n-threads",
         type=int,
-        default=120,
-        help="Number of threads to run",
+        default=1,  # FIXED: Default to 1 for HF mode
+        help="Number of threads to run (use 1 for HF models due to GPU threading limitations)",
     )
     args = parser.parse_args()
 
@@ -752,13 +762,13 @@ def main():
         physician_completions_main(
             run_reference_completions=False,
             num_examples=args.examples,
-            n_threads=args.n_threads or 1,
+            n_threads=args.n_threads if args.n_threads else 120,  # Use 120 for physician mode
         )
     elif args.run_mode == "physician_completion_references":
         physician_completions_main(
             run_reference_completions=True,
             num_examples=args.examples,
-            n_threads=args.n_threads or 1,
+            n_threads=args.n_threads if args.n_threads else 120,  # Use 120 for physician mode
         )
     elif args.run_mode == "hf":
         hf_main(
@@ -769,7 +779,7 @@ def main():
             grader_model=args.grader_model,
             subset_name=args.subset,
             num_examples=args.examples,
-            n_threads=args.n_threads or 1,
+            n_threads=args.n_threads,  # Pass through n_threads (defaults to 1)
         )
     else:
         raise ValueError(f"Invalid run mode: {args.run_mode}")
