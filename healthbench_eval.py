@@ -429,7 +429,7 @@ class HealthBenchEval(Eval):
             assert False, f"Invalid subset name: {subset_name}"
         # Support online Request, not blobfiles
         if input_path.startswith("http://") or input_path.startswith("https://"):
-            response = requests.get(input_path)
+            response = requests.get(input_path, timeout=30)
             response.raise_for_status()
             examples = [json.loads(line) for line in response.text.strip().split("\n") if line.strip()]
         else:
